@@ -2,4 +2,5 @@
 *.pyc
 *~
 *.bc
+src/relooper*.js
 
