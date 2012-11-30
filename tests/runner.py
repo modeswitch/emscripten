@@ -7256,6 +7256,7 @@ def process(filename):
 
     def test_gc(self):
       if self.emcc_args == None: return self.skip('needs ta2')
+      if Settings.ASM_JS: return self.skip('asm cannot support generic function table')
 
       Settings.GC_SUPPORT = 1
 
