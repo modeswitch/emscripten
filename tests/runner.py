@@ -5194,6 +5194,7 @@ def process(filename):
         }
       '''
       for linkable in [0, 1]:
+        print linkable
         Settings.LINKABLE = linkable # regression check for issue #273
         self.do_run(src, "1 2 3")
 
