@@ -124,6 +124,10 @@ function analyzer(data, sidePass) {
           bits = bits || 32; // things like pointers are all i32, but show up as 0 bits from getBits
           if (allowLegal && bits <= 32) return [{ ident: base + ('i' + bits in Runtime.INT_TYPES ? '' : '$0'), bits: bits }];
           if (isNumber(base)) return getLegalLiterals(base, bits);
+          if (base[0] == '{') {
+            warnOnce('seeing source of illegal data ' + base + ', likely an inline struct - assuming zeroinit');
+            return getLegalLiterals('0', bits);
+          }
           var ret = new Array(Math.ceil(bits/32));
           var i = 0;
           if (base == 'zeroinitializer' || base == 'undef') base = 0;
@@ -320,12 +324,13 @@ function analyzer(data, sidePass) {
                 }
                 // call, return: Return the first 32 bits, the rest are in temp
                 case 'call': {
-                  bits = getBits(value.type);
-                  var elements = getLegalVars(item.assignTo, bits);
                   var toAdd = [value];
                   // legalize parameters
                   legalizeFunctionParameters(value.params);
+                  // legalize return value, if any
                   if (value.assignTo && isIllegalType(item.type)) {
+                    bits = getBits(value.type);
+                    var elements = getLegalVars(item.assignTo, bits);
                     // legalize return value
                     value.assignTo = elements[0].ident;
                     for (var j = 1; j < elements.length; j++) {
@@ -1394,6 +1399,7 @@ function analyzer(data, sidePass) {
                 lineNum: label.lineNum + 0.5,
                 lines: label.lines.slice(j+1)
               });
+              func.labelsDict[newIdent] = func.labels[i+1];
               label.lines = label.lines.slice(0, j+1);
               label.lines.push({
                 intertype: 'branch',

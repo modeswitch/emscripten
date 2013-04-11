@@ -1457,7 +1457,42 @@ function makeGetPos(ptr) {
 
 var IHEAP_FHEAP = set('IHEAP', 'IHEAPU', 'FHEAP');
 
+var temp64f = new Float64Array(1);
+var temp32f = new Float32Array(temp64f.buffer);
+var temp32 = new Uint32Array(temp64f.buffer);
+var temp16 = new Uint16Array(temp64f.buffer);
+var temp8 = new Uint8Array(temp64f.buffer);
 var memoryInitialization = [];
+
+function writeInt8s(slab, i, value, type) {
+  var currSize;
+  switch (type) {
+    case 'i1':
+    case 'i8': temp8[0] = value;       currSize = 1; break;
+    case 'i16': temp16[0] = value;     currSize = 2; break;
+    case 'float': temp32f[0] = value;  currSize = 4; break;
+    case 'double': temp64f[0] = value; currSize = 8; break;
+    case 'i64': // fall through, i64 is two i32 chunks
+    case 'i32': // fall through, i32 can be a pointer
+    default: {
+      if (type == 'i32' || type == 'i64' || type[type.length-1] == '*') {
+        if (!isNumber(value)) { // function table stuff, etc.
+          slab[i] = value;
+          slab[i+1] = slab[i+2] = slab[i+3] = 0;
+          return 4;
+        }
+        temp32[0] = value;
+        currSize = 4;
+      } else {
+        throw 'what? ' + types[i];
+      }
+    }
+  }
+  for (var j = 0; j < currSize; j++) {
+    slab[i+j] = temp8[j];
+  }
+  return currSize;
+}
 
 function makePointer(slab, pos, allocator, type, ptr, finalMemoryInitialization) {
   assert(type, 'makePointer requires type info');
@@ -1498,51 +1533,20 @@ function makePointer(slab, pos, allocator, type, ptr, finalMemoryInitialization)
       }
     }
   } else { // USE_TYPED_ARRAYS == 2
-    // XXX This heavily assumes the target endianness is the same as our current endianness! XXX
-    var i = 0;
-    var temp64f = new Float64Array(1);
-    var temp32f = new Float32Array(temp64f.buffer);
-    var temp32 = new Uint32Array(temp64f.buffer);
-    var temp16 = new Uint16Array(temp64f.buffer);
-    var temp8 = new Uint8Array(temp64f.buffer);
-    while (i < slab.length) {
-      var currType = types[i];
-      if (!currType) { i++; continue }
-      var currSize = 0, currValue = slab[i];
-      switch (currType) {
-        case 'i1':
-        case 'i8': i++; continue;
-        case 'i16': temp16[0] = currValue;     currSize = 2; break;
-        case 'i64': // fall through, i64 is two i32 chunks
-        case 'i32': temp32[0] = currValue;     currSize = 4; break;
-        case 'float': temp32f[0] = currValue;  currSize = 4; break;
-        case 'double': temp64f[0] = currValue; currSize = 8; break;
-        default: {
-          if (currType[currType.length-1] == '*') {
-            if (!isNumber(currValue)) { // function table stuff, etc.
-              slab[i] = currValue;
-              slab[i+1] = slab[i+2] = slab[i+3] = 0;
-              i += 4;
-              continue;
-            }
-            temp32[0] = currValue;
-            currSize = 4;
-          } else {
-            throw 'what? ' + types[i];
-          }
-        }
+    if (!finalMemoryInitialization) {
+      // XXX This heavily assumes the target endianness is the same as our current endianness! XXX
+      var i = 0;
+      while (i < slab.length) {
+        var currType = types[i];
+        if (!currType) { i++; continue }
+        i += writeInt8s(slab, i, slab[i], currType);
       }
-      for (var j = 0; j < currSize; j++) {
-        slab[i+j] = temp8[j];
-      }
-      i += currSize;
+      types = 'i8';
     }
-    types = 'i8';
   }
-  if (allocator == 'ALLOC_NONE') {
+  if (allocator == 'ALLOC_NONE' && USE_TYPED_ARRAYS == 2) {
     if (!finalMemoryInitialization) {
       // writing out into memory, without a normal allocation. We put all of these into a single big chunk.
-      assert(USE_TYPED_ARRAYS == 2);
       assert(typeof slab == 'object');
       assert(slab.length % QUANTUM_SIZE == 0, slab.length); // must be aligned already
       var offset = ptr - TOTAL_STACK; // we assert on GLOBAL_BASE being equal to TOTAL_STACK
@@ -1556,7 +1560,7 @@ function makePointer(slab, pos, allocator, type, ptr, finalMemoryInitialization)
   }
 
   // JS engines sometimes say array initializers are too large. Work around that by chunking and calling concat to combine at runtime
-  var chunkSize = 10240;
+  var chunkSize = JS_CHUNK_SIZE;
   function chunkify(array) {
     // break very large slabs into parts
     var ret = '';
@@ -1569,6 +1573,9 @@ function makePointer(slab, pos, allocator, type, ptr, finalMemoryInitialization)
   }
   if (typeof slab == 'object' && slab.length > chunkSize) {
     slab = chunkify(slab);
+  }
+  if (typeof types == 'object') {
+    while (types.length < slab.length) types.push(0);
   }
   if (typeof types != 'string' && types.length > chunkSize) {
     types = chunkify(types);
@@ -1749,7 +1756,7 @@ function makeStructuralReturn(values, inAsm) {
     return 'return ' + asmCoercion(values.slice(1).map(function(value) {
       i++;
       return ASM_JS ? (inAsm ? 'tempRet' + i + ' = ' + value : 'asm.setTempRet' + i + '(' + value + ')')
-                    : 'tempRet' + (i++) + ' = ' + value;
+                    : 'tempRet' + i + ' = ' + value;
     }).concat([values[0]]).join(','), 'i32');
   } else {
     var i = 0;
@@ -1991,9 +1998,12 @@ function processMathop(item) {
       return finish(['(i64Math' + (ASM_JS ? '_' : '.') + type + '(' + asmCoercion(low1, 'i32') + ',' + asmCoercion(high1, 'i32') + ',' + asmCoercion(low2, 'i32') + ',' + asmCoercion(high2, 'i32') +
                      (lastArg ? ',' + asmCoercion(+lastArg, 'i32') : '') + '),' + makeGetValue('tempDoublePtr', 0, 'i32') + ')', makeGetValue('tempDoublePtr', Runtime.getNativeTypeSize('i32'), 'i32')]);
     }
-    function i64PreciseLib(type) {
+    function preciseCall(name) {
       Types.preciseI64MathUsed = true;
-      return finish(['_i64' + type[0].toUpperCase() + type.substr(1) + '(' + low1 + ',' + high1 + ',' + low2 + ',' + high2 + ')', 'tempRet0']);
+      return finish([name + '(' + low1 + ',' + high1 + ',' + low2 + ',' + high2 + ')', 'tempRet0']);
+    }
+    function i64PreciseLib(type) {
+      return preciseCall('_i64' + type[0].toUpperCase() + type.substr(1));
     }
     switch (op) {
       // basic integer ops
@@ -2055,7 +2065,7 @@ function processMathop(item) {
       }
       case 'sub': {
         if (PRECISE_I64_MATH) {
-          return i64PreciseOp('subtract');
+          return i64PreciseLib('subtract');
         } else {
           warnI64_1();
           return finish(splitI64(mergeI64(idents[0]) + '-' + mergeI64(idents[1]), true));
@@ -2063,7 +2073,7 @@ function processMathop(item) {
       }
       case 'sdiv': case 'udiv': {
         if (PRECISE_I64_MATH) {
-          return i64PreciseOp('divide', op[0] === 'u');
+          return preciseCall(op[0] === 'u' ? '___udivdi3' : '___divdi3');
         } else {
           warnI64_1();
           return finish(splitI64(makeRounding(mergeI64(idents[0], op[0] === 'u') + '/' + mergeI64(idents[1], op[0] === 'u'), bits, op[0] === 's'), true));
@@ -2071,7 +2081,7 @@ function processMathop(item) {
       }
       case 'mul': {
         if (PRECISE_I64_MATH) {
-          return i64PreciseOp('multiply');
+          return preciseCall('___muldi3');
         } else {
           warnI64_1();
           return finish(splitI64(mergeI64(idents[0], op[0] === 'u') + '*' + mergeI64(idents[1], op[0] === 'u'), true));
@@ -2079,7 +2089,7 @@ function processMathop(item) {
       }
       case 'urem': case 'srem': {
         if (PRECISE_I64_MATH) {
-          return i64PreciseOp('modulo', op[0] === 'u');
+          return preciseCall(op[0] === 'u' ? '___uremdi3' : '___remdi3');
         } else {
           warnI64_1();
           return finish(splitI64(mergeI64(idents[0], op[0] === 'u') + '%' + mergeI64(idents[1], op[0] === 'u'), true));
@@ -2340,5 +2350,16 @@ function getImplementationType(varInfo) {
 
 function charCode(char) {
   return char.charCodeAt(0);
+}
+
+function getTypeFromHeap(suffix) {
+  switch (suffix) {
+    case '8': return 'i8';
+    case '16': return 'i16';
+    case '32': return 'i32';
+    case 'F32': return 'float';
+    case 'F64': return 'double';
+    default: throw 'getTypeFromHeap? ' + suffix;
+  }
 }
 

@@ -230,7 +230,7 @@ var Types = {
 var Functions = {
   // All functions that will be implemented in this file. Maps id to signature
   implementedFunctions: {},
-  libraryFunctions: {}, // functions added from the library
+  libraryFunctions: {}, // functions added from the library. value 2 means asmLibraryFunction
   unimplementedFunctions: {}, // library etc. functions that we need to index, maps id to signature
 
   indexedFunctions: {},
@@ -374,7 +374,7 @@ var LibraryManager = {
   load: function() {
     if (this.library) return;
 
-    var libraries = ['library.js', 'library_browser.js', 'library_sdl.js', 'library_gl.js', 'library_glut.js', 'library_xlib.js', 'library_egl.js', 'library_gc.js', 'library_jansson.js', 'library_openal.js'].concat(additionalLibraries);
+    var libraries = ['library.js', 'library_browser.js', 'library_sdl.js', 'library_gl.js', 'library_glut.js', 'library_xlib.js', 'library_egl.js', 'library_gc.js', 'library_jansson.js', 'library_openal.js', 'library_glfw.js'].concat(additionalLibraries);
     for (var i = 0; i < libraries.length; i++) {
       eval(processMacros(preprocess(read(libraries[i]))));
     }

@@ -93,25 +93,27 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
   # Split input into the relevant parts for each phase
   pre = []
   funcs = [] # split up functions here, for parallelism later
-  func_idents = []
   meta = [] # needed by each function XXX
 
   if DEBUG: t = time.time()
   in_func = False
   ll_lines = open(infile).readlines()
+  curr_func = None
   for line in ll_lines:
     if in_func:
-      funcs[-1][1].append(line)
+      curr_func.append(line)
       if line.startswith('}'):
         in_func = False
-        funcs[-1] = (funcs[-1][0], ''.join(funcs[-1][1]))
-        pre.append(line) # pre needs it to, so we know about all implemented functions
+        funcs.append((curr_func[0], ''.join(curr_func))) # use the entire line as the identifier
+        # pre needs to know about all implemented functions, even for non-pre func
+        pre.append(curr_func[0])
+        pre.append(line)
+        curr_func = None
     else:
       if line.startswith(';'): continue
       if line.startswith('define '):
         in_func = True
-        funcs.append((line, [line])) # use the entire line as the identifier
-        pre.append(line) # pre needs it to, so we know about all implemented functions
+        curr_func = [line]
       elif line.find(' = type { ') > 0:
         pre.append(line) # type
       elif line.startswith('!'):
@@ -223,10 +225,10 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
 
   # TODO: minimize size of forwarded data from funcs to what we actually need
 
-  if cores == 1 and total_ll_size < MAX_CHUNK_SIZE:
-    assert len(chunks) == 1, 'no point in splitting up without multiple cores'
-
   if len(chunks) > 0:
+    if cores == 1 and total_ll_size < MAX_CHUNK_SIZE:
+      assert len(chunks) == 1, 'no point in splitting up without multiple cores'
+
     if DEBUG: print >> sys.stderr, '  emscript: phase 2 working on %d chunks %s (intended chunk size: %.2f MB, meta: %.2f MB, forwarded: %.2f MB, total: %.2f MB)' % (len(chunks), ('using %d cores' % cores) if len(chunks) > 1 else '', chunk_size/(1024*1024.), len(meta)/(1024*1024.), len(forwarded_data)/(1024*1024.), total_ll_size/(1024*1024.))
 
     commands = [
@@ -306,18 +308,20 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
     i += 2
   forwarded_json['Functions']['nextIndex'] = i
 
+  def split_32(x):
+    x = int(x)
+    return '%d,%d,%d,%d' % (x&255, (x >> 8)&255, (x >> 16)&255, (x >> 24)&255)
+
   indexing = forwarded_json['Functions']['indexedFunctions']
   def indexize(js):
     # In the global initial allocation, we need to split up into Uint8 format
-    def split_32(x):
-      x = int(x)
-      return '%d,%d,%d,%d' % (x&255, (x >> 8)&255, (x >> 16)&255, (x >> 24)&255)
-    ret = re.sub(r"\"'{{ FI_([\w\d_$]+) }}'\",0,0,0", lambda m: split_32(indexing.get(m.groups(0)[0]) or 0), js)
+    ret = re.sub(r"\"?'?{{ FI_([\w\d_$]+) }}'?\"?,0,0,0", lambda m: split_32(indexing.get(m.groups(0)[0]) or 0), js)
     return re.sub(r"'{{ FI_([\w\d_$]+) }}'", lambda m: str(indexing.get(m.groups(0)[0]) or 0), ret)
 
   blockaddrs = forwarded_json['Functions']['blockAddresses']
   def blockaddrsize(js):
-    return re.sub(r'{{{ BA_([\w\d_$]+)\|([\w\d_$]+) }}}', lambda m: str(blockaddrs[m.groups(0)[0]][m.groups(0)[1]]), js)
+    ret = re.sub(r'"?{{{ BA_([\w\d_$]+)\|([\w\d_$]+) }}}"?,0,0,0', lambda m: split_32(blockaddrs[m.groups(0)[0]][m.groups(0)[1]]), js)
+    return re.sub(r'"?{{{ BA_([\w\d_$]+)\|([\w\d_$]+) }}}"?', lambda m: str(blockaddrs[m.groups(0)[0]][m.groups(0)[1]]), ret)
 
   #if DEBUG: outfile.write('// pre\n')
   outfile.write(blockaddrsize(indexize(pre)))
@@ -343,6 +347,14 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
   if settings.get('ASM_JS'):
     post_funcs, post_rest = post.split('// EMSCRIPTEN_END_FUNCS\n')
     post = post_rest
+
+    # Move preAsms to their right place
+    def move_preasm(m):
+      contents = m.groups(0)[0]
+      outfile.write(contents + '\n')
+      return ''
+    post_funcs = re.sub(r'/\* PRE_ASM \*/(.*)\n', lambda m: move_preasm(m), post_funcs)
+
     funcs_js += ['\n' + post_funcs + '// EMSCRIPTEN_END_FUNCS\n']
 
     simple = os.environ.get('EMCC_SIMPLE_ASM')
@@ -380,15 +392,12 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
     if settings['CHECK_HEAP_ALIGN']: basic_funcs += ['CHECK_ALIGN_2', 'CHECK_ALIGN_4', 'CHECK_ALIGN_8']
     basic_vars = ['STACKTOP', 'STACK_MAX', 'tempDoublePtr', 'ABORT']
     basic_float_vars = ['NaN', 'Infinity']
-    if forwarded_json['Types']['preciseI64MathUsed']:
-      basic_funcs += ['i64Math_' + op for op in ['add', 'subtract', 'multiply', 'divide', 'modulo']]
-      asm_setup += '''
-var i64Math_add = function(a, b, c, d) { i64Math.add(a, b, c, d) };
-var i64Math_subtract = function(a, b, c, d) { i64Math.subtract(a, b, c, d) };
-var i64Math_multiply = function(a, b, c, d) { i64Math.multiply(a, b, c, d) };
-var i64Math_divide = function(a, b, c, d, e) { i64Math.divide(a, b, c, d, e) };
-var i64Math_modulo = function(a, b, c, d, e) { i64Math.modulo(a, b, c, d, e) };
-'''
+
+    if forwarded_json['Types']['preciseI64MathUsed'] or \
+       forwarded_json['Functions']['libraryFunctions'].get('llvm_cttz_i32') or \
+       forwarded_json['Functions']['libraryFunctions'].get('llvm_ctlz_i32'):
+      basic_vars += ['cttz_i8', 'ctlz_i8']
+
     asm_runtime_funcs = ['stackAlloc', 'stackSave', 'stackRestore', 'setThrew'] + ['setTempRet%d' % i for i in range(10)]
     # function tables
     def asm_coerce(value, sig):
@@ -409,6 +418,18 @@ var i64Math_modulo = function(a, b, c, d, e) { i64Math.modulo(a, b, c, d, e) };
     %s;
   }
 ''' % (sig, ',' if len(sig) > 1 else '', args, arg_coercions, ret))
+      args = ','.join(['a' + str(i) for i in range(1, len(sig))])
+      args = 'index' + (',' if args else '') + args
+      asm_setup += '''
+function invoke_%s(%s) {
+  try {
+    %sModule.dynCall_%s(%s);
+  } catch(e) {
+    asm.setThrew(1);
+  }
+}
+''' % (sig, args, 'return ' if sig[0] != 'v' else '', sig, args)
+      basic_funcs.append('invoke_%s' % sig)
 
     # calculate exports
     exported_implemented_functions = list(exported_implemented_functions)
@@ -426,7 +447,7 @@ var i64Math_modulo = function(a, b, c, d, e) { i64Math.modulo(a, b, c, d, e) };
       pass
     # If no named globals, only need externals
     global_vars = map(lambda g: g['name'], filter(lambda g: settings['NAMED_GLOBALS'] or g.get('external') or g.get('unIndexable'), forwarded_json['Variables']['globals'].values()))
-    global_funcs = ['_' + x for x in forwarded_json['Functions']['libraryFunctions'].keys()]
+    global_funcs = ['_' + key for key, value in forwarded_json['Functions']['libraryFunctions'].iteritems() if value != 2]
     def math_fix(g):
       return g if not g.startswith('Math_') else g.split('_')[1];
     asm_global_funcs = ''.join(['  var ' + g.replace('.', '_') + '=global.' + g + ';\n' for g in maths]) + \

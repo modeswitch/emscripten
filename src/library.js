@@ -2118,7 +2118,20 @@ LibraryManager.library = {
       return 1;
     }
   },
-  // TODO: Implement initgroups, setgroups (grp.h).
+  // TODO: Implement initgroups (grp.h).
+  setgroups__deps: ['__setErrNo', '$ERRNO_CODES', 'sysconf'],
+  setgroups: function (ngroups, gidset) {
+    // int setgroups(int ngroups, const gid_t *gidset);
+    // https://developer.apple.com/library/mac/#documentation/Darwin/Reference/ManPages/man2/setgroups.2.html
+    if (ngroups < 1 || ngroups > _sysconf({{{ cDefine('_SC_NGROUPS_MAX') }}})) {
+      ___setErrNo(ERRNO_CODES.EINVAL);
+      return -1;
+    } else {
+      // We have just one process/user/group, so it makes no sense to set groups.
+      ___setErrNo(ERRNO_CODES.EPERM);
+      return -1;
+    }
+  },
   gethostid: function() {
     // long gethostid(void);
     // http://pubs.opengroup.org/onlinepubs/000095399/functions/gethostid.html
@@ -2513,6 +2526,11 @@ LibraryManager.library = {
 
       if (format[formatIndex] === '%') {
         formatIndex++;
+        var suppressAssignment = false;
+        if (format[formatIndex] == '*') {
+          suppressAssignment = true;
+          formatIndex++;
+        }
         var maxSpecifierStart = formatIndex;
         while (format[formatIndex].charCodeAt(0) >= {{{ charCode('0') }}} &&
                format[formatIndex].charCodeAt(0) <= {{{ charCode('9') }}}) {
@@ -2578,6 +2596,8 @@ LibraryManager.library = {
           unget();
         }
         if (buffer.length === 0) return 0;  // Failure.
+        if (suppressAssignment) continue;
+
         var text = buffer.join('');
         var argPtr = {{{ makeGetValue('varargs', 'argIndex', 'void*') }}};
         argIndex += Runtime.getNativeFieldSize('void*');
@@ -4893,16 +4913,20 @@ LibraryManager.library = {
       }
       return 8;
     }
-    return 'var ctlz_i8 = [' + range(256).map(function(x) { return ctlz(x) }).join(',') + '];';
+    return 'var ctlz_i8 = allocate([' + range(256).map(function(x) { return ctlz(x) }).join(',') + '], "i8", ALLOC_STACK);';
   }],
+  llvm_ctlz_i32__asm: true,
+  llvm_ctlz_i32__sig: 'ii',
   llvm_ctlz_i32: function(x) {
-    var ret = ctlz_i8[x >>> 24];
-    if (ret < 8) return ret;
-    var ret = ctlz_i8[(x >> 16)&0xff];
-    if (ret < 8) return ret + 8;
-    var ret = ctlz_i8[(x >> 8)&0xff];
-    if (ret < 8) return ret + 16;
-    return ctlz_i8[x&0xff] + 24;
+    x = x|0;
+    var ret = 0;
+    ret = {{{ makeGetValueAsm('ctlz_i8', 'x >>> 24', 'i8') }}};
+    if ((ret|0) < 8) return ret|0;
+    var ret = {{{ makeGetValueAsm('ctlz_i8', '(x >> 16)&0xff', 'i8') }}};
+    if ((ret|0) < 8) return (ret + 8)|0;
+    var ret = {{{ makeGetValueAsm('ctlz_i8', '(x >> 8)&0xff', 'i8') }}};
+    if ((ret|0) < 8) return (ret + 16)|0;
+    return ({{{ makeGetValueAsm('ctlz_i8', 'x&0xff', 'i8') }}} + 24)|0;
   },
 
   llvm_ctlz_i64__deps: ['llvm_ctlz_i32'],
@@ -4925,16 +4949,20 @@ LibraryManager.library = {
       }
       return 8;
     }
-    return 'var cttz_i8 = [' + range(256).map(function(x) { return cttz(x) }).join(',') + '];';
+    return 'var cttz_i8 = allocate([' + range(256).map(function(x) { return cttz(x) }).join(',') + '], "i8", ALLOC_STACK);';
   }],
+  llvm_cttz_i32__asm: true,
+  llvm_cttz_i32__sig: 'ii',
   llvm_cttz_i32: function(x) {
-    var ret = cttz_i8[x & 0xff];
-    if (ret < 8) return ret;
-    var ret = cttz_i8[(x >> 8)&0xff];
-    if (ret < 8) return ret + 8;
-    var ret = cttz_i8[(x >> 16)&0xff];
-    if (ret < 8) return ret + 16;
-    return cttz_i8[x >>> 24] + 24;
+    x = x|0;
+    var ret = 0;
+    ret = {{{ makeGetValueAsm('cttz_i8', 'x & 0xff', 'i8') }}};
+    if ((ret|0) < 8) return ret|0;
+    var ret = {{{ makeGetValueAsm('cttz_i8', '(x >> 8)&0xff', 'i8') }}};
+    if ((ret|0) < 8) return (ret + 8)|0;
+    var ret = {{{ makeGetValueAsm('cttz_i8', '(x >> 16)&0xff', 'i8') }}};
+    if ((ret|0) < 8) return (ret + 16)|0;
+    return ({{{ makeGetValueAsm('cttz_i8', 'x >>> 24', 'i8') }}} + 24)|0;
   },
 
   llvm_cttz_i64__deps: ['llvm_cttz_i32'],
@@ -4996,6 +5024,7 @@ LibraryManager.library = {
   __cxa_free_exception: function(ptr) {
     return _free(ptr);
   },
+  __cxa_throw__sig: 'viii',
   __cxa_throw__deps: ['llvm_eh_exception', '_ZSt18uncaught_exceptionv', '__cxa_find_matching_catch'],
   __cxa_throw: function(ptr, type, destructor) {
     if (!___cxa_throw.initialized) {
@@ -5135,8 +5164,12 @@ LibraryManager.library = {
   // functionality boils down to picking a suitable 'catch' block.
   // We'll do that here, instead, to keep things simpler.
 
-  __cxa_find_matching_catch__deps: ['__cxa_does_inherit', '__cxa_is_number_type'],
-  __cxa_find_matching_catch: function(thrown, throwntype, typeArray) {
+  __cxa_find_matching_catch__deps: ['__cxa_does_inherit', '__cxa_is_number_type', '__resumeException'],
+  __cxa_find_matching_catch: function(thrown, throwntype) {
+    if (thrown == -1) thrown = {{{ makeGetValue('_llvm_eh_exception.buf', '0', 'void*') }}};
+    if (throwntype == -1) throwntype = {{{ makeGetValue('_llvm_eh_exception.buf', QUANTUM_SIZE, 'void*') }}};
+    var typeArray = Array.prototype.slice.call(arguments, 2);
+
     // If throwntype is a pointer, this means a pointer has been
     // thrown. When a pointer is thrown, actually what's thrown
     // is a pointer to the pointer. We'll dereference it.
@@ -5158,6 +5191,15 @@ LibraryManager.library = {
     // or encounter a type for which emscripten doesn't have suitable
     // typeinfo defined. Best-efforts match just in case.
     {{{ makeStructuralReturn(['thrown', 'throwntype']) }}};
+  },
+
+  __resumeException__deps: [function() { Functions.libraryFunctions['__resumeException'] = 1 }], // will be called directly from compiled code
+  __resumeException: function(ptr) {
+#if EXCEPTION_DEBUG
+    Module.print("Resuming exception");
+#endif
+    if ({{{ makeGetValue('_llvm_eh_exception.buf', 0, 'void*') }}} == 0) {{{ makeSetValue('_llvm_eh_exception.buf', 0, 'ptr', 'void*') }}};
+    {{{ makeThrow('ptr') }}};
   },
 
   // Recursively walks up the base types of 'possibilityType'
@@ -5262,9 +5304,11 @@ LibraryManager.library = {
 
   llvm_umul_with_overflow_i64__deps: [function() { Types.preciseI64MathUsed = 1 }],
   llvm_umul_with_overflow_i64: function(xl, xh, yl, yh) {
-    i64Math.multiply(xl, xh, yl, yh);
-    {{{ makeStructuralReturn([makeGetTempDouble(0, 'i32'), makeGetTempDouble(1, 'i32'), '0']) }}};
-    // XXX Need to hack support for second param in long.js
+#if ASSERTIONS
+    Runtime.warnOnce('no overflow support in llvm_umul_with_overflow_i64');
+#endif
+    var low = ___muldi3(xl, xh, yl, yh);
+    {{{ makeStructuralReturn(['low', 'tempRet0', '0']) }}};
   },
 
   llvm_stacksave: function() {
@@ -7803,11 +7847,25 @@ LibraryManager.library = {
     var l = 0, h = 0, overflow = 0;
     l = (a + c)>>>0;
     h = (b + d)>>>0;
-    if ((l>>>0) < (a>>>0)) { // iff we overflowed
+    if ((h>>>0) < (b>>>0)) overflow = 1;
+    if ((l>>>0) < (a>>>0)) {
       h = (h+1)>>>0;
-      overflow = 1;
+      if ((h>>>0) == 0) overflow = 1; // two possibilities to overflow here
     }
     {{{ makeStructuralReturn(['l|0', 'h', 'overflow'], true) }}};
+  },
+
+  i64Subtract__asm: true,
+  i64Subtract__sig: 'iiiii',
+  i64Subtract: function(a, b, c, d) {
+    a = a|0; b = b|0; c = c|0; d = d|0;
+    var l = 0, h = 0;
+    l = (a - c)>>>0;
+    h = (b - d)>>>0;
+    if ((l>>>0) > (a>>>0)) { // iff we overflowed
+      h = (h-1)>>>0;
+    }
+    {{{ makeStructuralReturn(['l|0', 'h'], true) }}};
   },
 
   bitshift64Shl__asm: true,

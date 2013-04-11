@@ -35,8 +35,9 @@ var ASSERTIONS = 1; // Whether we should add runtime assertions, for example to
                     // if code flow runs into a fault
 var VERBOSE = 0; // When set to 1, will generate more verbose output during compilation.
 
-var INVOKE_RUN = 1; // Whether we will call run(). Disable if you embed the generated
-                    // code in your own, and will call run() yourself at the right time
+var INVOKE_RUN = 1; // Whether we will run the main() function. Disable if you embed the generated
+                    // code in your own, and will call main() yourself at the right time (which you
+                    // can do with Module.callMain(), with an optional parameter of commandline args).
 var INIT_HEAP = 0; // Whether to initialize memory anywhere other than the stack to 0.
 var TOTAL_STACK = 5*1024*1024; // The total stack size. There is no way to enlarge the stack, so this
                                // value must be large enough for the program's requirements. If
@@ -149,7 +150,7 @@ var LABEL_FUNCTION_FILTERS = []; // Filters for function label debug.
                                  // labels of functions that is equaled to
                                  // one of the filters are printed out
                                  // When the array is empty, the filter is disabled.
-var EXCEPTION_DEBUG = 0; // Print out exceptions in emscriptened code
+var EXCEPTION_DEBUG = 0; // Print out exceptions in emscriptened code. Does not work in asm.js mode
 
 var LIBRARY_DEBUG = 0; // Print out when we enter a library call (library*.js). You can also unset
                        // Runtime.debug at runtime for logging to cease, and can set it when you
@@ -357,6 +358,8 @@ var EXPLICIT_ZEXT = 0; // If 1, generate an explicit conversion of zext i1 to i3
 var NECESSARY_BLOCKADDRS = []; // List of (function, block) for all block addresses that are taken.
 
 var EMIT_GENERATED_FUNCTIONS = 0; // whether to emit the list of generated functions, needed for external JS optimization passes
+
+var JS_CHUNK_SIZE = 10240; // Used as a maximum size before breaking up expressions and lines into smaller pieces
 
 // Compiler debugging options
 var DEBUG_TAGS_SHOWING = [];

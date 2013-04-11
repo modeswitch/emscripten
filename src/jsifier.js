@@ -108,7 +108,7 @@ function JSify(data, functionsOnly, givenFunctions) {
     }
   });
 
-  if (phase == 'funcs') { // pre has function shells, just to defined implementedFunctions
+  if (phase == 'funcs') { // || phase == 'pre') { // pre has function shells, just to defined implementedFunctions
     var MAX_BATCH_FUNC_LINES = 1000;
     while (data.unparsedFunctions.length > 0) {
       var currFuncLines = [];
@@ -468,7 +468,7 @@ function JSify(data, functionsOnly, givenFunctions) {
             asmLibraryFunctions.push(contentText);
             contentText = ' ';
             EXPORTED_FUNCTIONS[ident] = 1;
-            delete Functions.libraryFunctions[ident.substr(1)];
+            Functions.libraryFunctions[ident.substr(1)] = 2;
           }
         }
         if ((!ASM_JS || phase == 'pre') &&
@@ -1149,20 +1149,21 @@ function JSify(data, functionsOnly, givenFunctions) {
     }
     // If there is no current exception, set this one as it (during a resume, the current exception can be wiped out)
     var ptr = makeStructuralAccess(item.ident, 0);
-    return (EXCEPTION_DEBUG ? 'Module.print("Resuming exception");' : '') + 
-      'if (' + makeGetValue('_llvm_eh_exception.buf', 0, 'void*') + ' == 0) { ' + makeSetValue('_llvm_eh_exception.buf', 0, ptr, 'void*') + ' } ' + 
-      makeThrow(ptr) + ';';
+    return '___resumeException(' + asmCoercion(ptr, 'i32') + ')';
   });
   makeFuncLineActor('invoke', function(item) {
     // Wrapping in a function lets us easily return values if we are
     // in an assignment
+    var disabled = DISABLE_EXCEPTION_CATCHING == 2  && !(item.funcData.ident in EXCEPTION_CATCHING_WHITELIST); 
     var phiSets = calcPhiSets(item);
-    var call_ = makeFunctionCall(item.ident, item.params, item.funcData, item.type);
-  
+    var call_ = makeFunctionCall(item.ident, item.params, item.funcData, item.type, ASM_JS && !disabled);
+
     var ret;
 
-    if (DISABLE_EXCEPTION_CATCHING == 2  && !(item.funcData.ident in EXCEPTION_CATCHING_WHITELIST)) {
+    if (disabled) {
       ret = call_ + ';';
+    } else if (ASM_JS) {
+      ret = '(__THREW__ = 0,' +  call_ + ');';
     } else {
       ret = '(function() { try { __THREW__ = 0; return '
           + call_ + ' '
@@ -1172,7 +1173,6 @@ function JSify(data, functionsOnly, givenFunctions) {
           + (EXCEPTION_DEBUG ? 'Module.print("Exception: " + e + ", currently at: " + (new Error().stack)); ' : '')
           + 'return null } })();';
     }
-
 
     if (item.assignTo) {
       ret = 'var ' + item.assignTo + ' = ' + ret;
@@ -1210,8 +1210,8 @@ function JSify(data, functionsOnly, givenFunctions) {
     }
   });
   makeFuncLineActor('landingpad', function(item) {
-    var catchTypeArray = item.catchables.map(finalizeLLVMParameter).join(',');
-    var ret = '___cxa_find_matching_catch('+ makeGetValue('_llvm_eh_exception.buf', '0', 'void*') +',' + makeGetValue('_llvm_eh_exception.buf', QUANTUM_SIZE, 'void*') + ',[' + catchTypeArray +'])';
+    var catchTypeArray = item.catchables.map(finalizeLLVMParameter).map(function(element) { return asmCoercion(element, 'i32') }).join(',');
+    var ret = asmCoercion('___cxa_find_matching_catch(-1, -1' + (catchTypeArray.length > 0 ? ',' + catchTypeArray : '') +')', 'i32');
     if (USE_TYPED_ARRAYS == 2) {
       ret = makeVarDef(item.assignTo) + '$0 = ' + ret + '; ' + item.assignTo + '$1 = tempRet0;';
       item.assignTo = null;
@@ -1291,7 +1291,7 @@ function JSify(data, functionsOnly, givenFunctions) {
     return ret;
   });
 
-  function makeFunctionCall(ident, params, funcData, type) {
+  function makeFunctionCall(ident, params, funcData, type, forceByPointer) {
     // We cannot compile assembly. See comment in intertyper.js:'Call'
     assert(ident != 'asm', 'Inline assembly cannot be compiled to JavaScript!');
 
@@ -1319,6 +1319,11 @@ function JSify(data, functionsOnly, givenFunctions) {
     var hasVarArgs = isVarArgsFunctionType(type);
     var normalArgs = (hasVarArgs && !useJSArgs) ? countNormalArgs(type) : -1;
     var byPointer = getVarData(funcData, ident);
+    var byPointerForced = false;
+
+    if (forceByPointer && !byPointer) {
+      byPointer = byPointerForced = true;
+    }
 
     params.forEach(function(param, i) {
       var val = finalizeParam(param);
@@ -1343,7 +1348,7 @@ function JSify(data, functionsOnly, givenFunctions) {
 
     args = args.map(function(arg, i) { return indexizeFunctions(arg, argsTypes[i]) });
     if (ASM_JS) {
-      if (shortident in Functions.libraryFunctions || simpleIdent in Functions.libraryFunctions) {
+      if (shortident in Functions.libraryFunctions || simpleIdent in Functions.libraryFunctions || byPointerForced) {
         args = args.map(function(arg, i) { return asmCoercion(arg, argsTypes[i]) });
       } else {
         args = args.map(function(arg, i) { return asmEnsureFloat(arg, argsTypes[i]) });
@@ -1421,12 +1426,20 @@ function JSify(data, functionsOnly, givenFunctions) {
       var sig = Functions.getSignature(returnType, argsTypes, hasVarArgs);
       if (ASM_JS) {
         assert(returnType.search(/\("'\[,/) == -1); // XXX need isFunctionType(type, out)
-        callIdent = '(' + callIdent + ')&{{{ FTM_' + sig + ' }}}'; // the function table mask is set in emscripten.py
+        if (!byPointerForced) {
+          callIdent = '(' + callIdent + ')&{{{ FTM_' + sig + ' }}}'; // the function table mask is set in emscripten.py
+        } else {
+          // This is a forced call, through an invoke_*.
+          // note: no need to update argsTypes at this point
+          Functions.unimplementedFunctions[callIdent] = sig;
+          args.unshift(byPointerForced ? Functions.getIndex(callIdent) : callIdent);
+          callIdent = 'invoke_' + sig;
+        }
       } else if (SAFE_DYNCALLS) {
         assert(!ASM_JS, 'cannot emit safe dyncalls in asm');
         callIdent = '(tempInt=' + callIdent + ',tempInt < 0 || tempInt >= FUNCTION_TABLE.length-1 || !FUNCTION_TABLE[tempInt] ? abort("dyncall error: ' + sig + ' " + FUNCTION_TABLE_NAMES[tempInt]) : tempInt)';
       }
-      callIdent = Functions.getTable(sig) + '[' + callIdent + ']';
+      if (!byPointerForced) callIdent = Functions.getTable(sig) + '[' + callIdent + ']';
     }
 
     var ret = callIdent + '(' + args.join(', ') + ')';
@@ -1499,16 +1512,42 @@ function JSify(data, functionsOnly, givenFunctions) {
         }
       }
       var generated = itemsDict.function.concat(itemsDict.type).concat(itemsDict.GlobalVariableStub).concat(itemsDict.GlobalVariable);
-      if (!DEBUG_MEMORY) print(generated.map(function(item) { return item.JS }).join('\n'));
+      print(generated.map(function(item) { return item.JS }).join('\n'));
 
       if (phase == 'pre') {
         if (memoryInitialization.length > 0) {
+          // apply postsets directly into the big memory initialization
+          itemsDict.GlobalVariablePostSet = itemsDict.GlobalVariablePostSet.filter(function(item) {
+            var m;
+            if (m = /^HEAP([\dFU]+)\[([()>\d]+)\] *= *([()|\d{}\w_' ]+);?$/.exec(item.JS)) {
+              var type = getTypeFromHeap(m[1]);
+              var bytes = Runtime.getNativeTypeSize(type);
+              var target = eval(m[2]) << log2(bytes);
+              var value = m[3];
+              try {
+                value = eval(value);
+              } catch(e) {
+                // possibly function table {{{ FT_* }}} etc.
+                if (value.indexOf('{{ ') < 0) return true;
+              }
+              writeInt8s(memoryInitialization, target - TOTAL_STACK, value, type);
+              return false;
+            }
+            return true;
+          });
           // write out the singleton big memory initialization value
-          print('/* teh global */ ' + makePointer(memoryInitialization, null, 'ALLOC_NONE', 'i8', 'TOTAL_STACK', true)); // we assert on TOTAL_STACK == GLOBAL_BASE
+          print('/* memory initializer */ ' + makePointer(memoryInitialization, null, 'ALLOC_NONE', 'i8', 'TOTAL_STACK', true)); // we assert on TOTAL_STACK == GLOBAL_BASE
+        } else {
+          print('/* no memory initializer */'); // test purposes
         }
+
+        // Run postsets right before main, and after the memory initializer has been set up
+        print('function runPostSets() {\n');
+        print(itemsDict.GlobalVariablePostSet.map(function(item) { return item.JS }).join('\n'));
+        print('}\n');
+        print('if (!awaitingMemoryInitializer) runPostSets();\n'); // if we load the memory initializer, this is done later
       }
 
-      if (!DEBUG_MEMORY) print(itemsDict.GlobalVariablePostSet.map(function(item) { return item.JS }).join('\n'));
       return;
     }
 
@@ -1567,10 +1606,26 @@ function JSify(data, functionsOnly, givenFunctions) {
     // "Final shape that will be created").
     if (PRECISE_I64_MATH && Types.preciseI64MathUsed) {
       if (!INCLUDE_FULL_LIBRARY) {
-        ['i64Add', 'bitshift64Shl', 'bitshift64Lshr', 'bitshift64Ashr'].forEach(function(func) {
-          print(processLibraryFunction(LibraryManager.library[func], func)); // must be first to be close to generated code
-          Functions.implementedFunctions['_' + func] = LibraryManager.library[func + '__sig'];
+        // first row are utilities called from generated code, second are needed from fastLong
+        ['i64Add', 'i64Subtract', 'bitshift64Shl', 'bitshift64Lshr', 'bitshift64Ashr',
+         'llvm_ctlz_i32', 'llvm_cttz_i32'].forEach(function(func) {
+          if (!Functions.libraryFunctions[func]) {
+            print(processLibraryFunction(LibraryManager.library[func], func)); // must be first to be close to generated code
+            Functions.implementedFunctions['_' + func] = LibraryManager.library[func + '__sig'];
+            Functions.libraryFunctions[func] = 1;
+            // limited dependency handling
+            var deps = LibraryManager.library[func + '__deps'];
+            if (deps) {
+              deps.forEach(function(dep) {
+                assert(typeof dep == 'function');
+                var text = dep();
+                assert(text.indexOf('\n') < 0);
+                print('/* PRE_ASM */ ' + text + '\n');
+              });
+            }
+          }
         });
+        print(read('fastLong.js'));
       }
       print('// EMSCRIPTEN_END_FUNCS\n');
       print(read('long.js'));
